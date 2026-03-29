@@ -1,0 +1,1232 @@
+import { Request, Response } from 'express';
+import { prisma } from '../utils/prisma';
+import { createGhnOrderInternal, callGhnApi, validateAndFormatPhone, preValidateGhnOrder } from './shipping.controller';
+
+// Validation function để kiểm tra address và GHN connectivity
+async function validateShippingRequirements(address: any): Promise<{ valid: boolean; error?: string }> {
+  const errors: string[] = [];
+
+  // Kiểm tra đầy đủ thông tin địa chỉ
+  if (!address.full_name || address.full_name.trim() === '') {
+    errors.push('Tên người nhận (full_name) là bắt buộc');
+  }
+
+  if (!address.phone || address.phone.trim() === '') {
+    errors.push('Số điện thoại (phone) là bắt buộc');
+  } else {
+    try {
+      validateAndFormatPhone(address.phone);
+    } catch (error: any) {
+      errors.push(`Số điện thoại không hợp lệ: ${error.message}`);
+    }
+  }
+
+  if (!address.address_line || address.address_line.trim() === '') {
+    errors.push('Địa chỉ chi tiết (address_line) là bắt buộc');
+  }
+
+  // Kiểm tra address có đủ GHN IDs
+  if (!address.ward_code || address.ward_code.trim() === '') {
+    errors.push('Mã phường/xã (ward_code) là bắt buộc cho GHN');
+  }
+
+  if (!address.district_id || Number.isNaN(Number(address.district_id)) || Number(address.district_id) <= 0) {
+    errors.push('Mã quận/huyện (district_id) là bắt buộc và phải là số hợp lệ cho GHN');
+  }
+
+  if (errors.length > 0) {
+    return {
+      valid: false,
+      error: `Địa chỉ thiếu thông tin: ${errors.join('; ')}. Vui lòng cập nhật địa chỉ với đầy đủ thông tin.`,
+    };
+  }
+
+  // Kiểm tra connectivity với GHN API (test với provinces endpoint)
+  try {
+    await callGhnApi('/master-data/province');
+    return { valid: true };
+  } catch (error: any) {
+    return {
+      valid: false,
+      error: `Không thể kết nối với GHN API: ${error.message}. Vui lòng thử lại sau.`,
+    };
+  }
+}
+
+// Helper function để retry GHN API call
+async function retryGhnOrderCreation(
+  params: Parameters<typeof createGhnOrderInternal>[0],
+  maxRetries: number = 3,
+  delayMs: number = 1000
+): Promise<{ success: boolean; orderCode: string | null; error: string | null }> {
+  // Validate params trước khi retry để tránh retry không cần thiết
+  const { validateGhnOrderParams } = await import('./shipping.controller');
+  const validation = validateGhnOrderParams({
+    to_name: params.to_name,
+    to_phone: params.to_phone,
+    to_address: params.to_address,
+    to_ward_code: params.to_ward_code,
+    to_district_id: params.to_district_id,
+    from_name: params.from_name,
+    from_phone: params.from_phone,
+    from_address: params.from_address,
+    from_ward_code: params.from_ward_code,
+    from_district_id: params.from_district_id,
+    weight: params.weight,
+    items: params.items,
+  });
+
+  if (!validation.valid) {
+    console.error('❌ Validation failed before retry:', validation.error);
+    return { success: false, orderCode: null, error: validation.error || 'Validation failed' };
+  }
+
+  let lastError: string | null = null;
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const ghnOrder = await createGhnOrderInternal(params);
+      const orderCode = ghnOrder?.order_code || ghnOrder?.data?.order_code || null;
+      
+      if (orderCode) {
+        return { success: true, orderCode, error: null };
+      }
+      
+      lastError = 'GHN API returned success but order_code is missing';
+    } catch (error: any) {
+      lastError = error.message || 'Unknown error';
+      
+      // Nếu lỗi là validation error, không cần retry
+      if (error.message?.includes('Validation failed') || error.message?.includes('không hợp lệ')) {
+        console.error('❌ Validation error detected, skipping retry:', error.message);
+        return { success: false, orderCode: null, error: lastError };
+      }
+      
+      if (attempt < maxRetries) {
+        // Wait before retry
+        await new Promise(resolve => setTimeout(resolve, delayMs * attempt));
+        console.log(`Retrying GHN order creation (attempt ${attempt + 1}/${maxRetries})...`);
+      }
+    }
+  }
+  
+  return { success: false, orderCode: null, error: lastError };
+}
+
+// Kiểu request có user
+interface AuthenticatedRequest extends Request {
+  user?: { id: string };
+}
+
+// SỬA: Thêm include product_variant vào fetchCartItems
+type CartItemWithProduct = Awaited<ReturnType<typeof fetchCartItems>>[number];
+type VoucherApplication = Awaited<ReturnType<typeof validateVoucherForCart>>;
+
+async function fetchCartItems(params: { userId: string; cartItemIds: string[] }) {
+  return prisma.cart_item.findMany({
+    where: {
+      user_id: params.userId,
+      id: { in: params.cartItemIds },
+    },
+    include: { 
+      product: true,
+      product_variant: true // THÊM: Include variant information
+    },
+  });
+}
+
+// SỬA: Tính giá ưu tiên từ variant nếu có
+const sumCartItems = (items: CartItemWithProduct[]) =>
+  items.reduce((sum, item) => {
+    const price = item.product_variant?.price ?? item.product.price; // ƯU TIÊN VARIANT PRICE
+    return sum + Number(price || 0) * item.quantity;
+  }, 0);
+
+const nowDate = () => new Date();
+
+class VoucherError extends Error {
+  status: number;
+  constructor(message: string, status = 400) {
+    super(message);
+    this.status = status;
+  }
+}
+
+// SỬA: Tính base amount với variant price
+async function validateVoucherForCart(
+  voucherCode: string,
+  userId: string,
+  cartItems: CartItemWithProduct[]
+) {
+  const voucher = await prisma.vouchers.findUnique({ where: { code: voucherCode.toUpperCase() } });
+  if (!voucher) throw new VoucherError('Voucher không tồn tại');
+
+  const now = nowDate();
+  if (voucher.status !== 'ACTIVE' || now < voucher.start_at || now > voucher.end_at) {
+    throw new VoucherError('Voucher đã hết hạn hoặc chưa bắt đầu');
+  }
+
+  if (voucher.applicable_user_id && voucher.applicable_user_id !== userId) {
+    throw new VoucherError('Voucher này không dành cho bạn');
+  }
+
+  if (voucher.usage_limit_total && (voucher.used_count ?? 0) >= voucher.usage_limit_total) {
+    throw new VoucherError('Voucher đã đạt giới hạn sử dụng');
+  }
+
+  // For PLATFORM vouchers, allow usage without saving first
+  // For other vouchers, require saving first
+  // PLATFORM vouchers are those with source='ADMIN' or type='PLATFORM'
+  const isPlatformVoucher = voucher.source === 'ADMIN' || voucher.type === 'PLATFORM' || voucher.product_id !== null;
+  
+  let savedVoucher = await prisma.user_vouchers.findUnique({
+    where: {
+      user_id_voucher_id: {
+        user_id: userId,
+        voucher_id: voucher.id,
+      },
+    },
+  });
+
+  if (!savedVoucher && !isPlatformVoucher) {
+    throw new VoucherError('Bạn cần lưu voucher trước khi sử dụng');
+  }
+
+  // If PLATFORM voucher not saved yet, we'll create it during order creation
+  if (savedVoucher) {
+    if (
+      voucher.usage_limit_per_user &&
+      savedVoucher.usage_count >= voucher.usage_limit_per_user
+    ) {
+      throw new VoucherError('Bạn đã sử dụng voucher này tối đa số lần cho phép');
+    }
+  } else if (isPlatformVoucher && voucher.usage_limit_per_user) {
+    // Check if user has used this PLATFORM voucher before (even if not saved)
+    const existingUsage = await prisma.user_vouchers.findUnique({
+      where: {
+        user_id_voucher_id: {
+          user_id: userId,
+          voucher_id: voucher.id,
+        },
+      },
+    });
+    if (existingUsage && existingUsage.usage_count >= voucher.usage_limit_per_user) {
+      throw new VoucherError('Bạn đã sử dụng voucher này tối đa số lần cho phép');
+    }
+  }
+
+  let applicableItems = cartItems;
+  // For PLATFORM vouchers (source='ADMIN'), don't filter by seller_id
+  // For seller vouchers, filter by seller_id
+  if (voucher.seller_id && voucher.source !== 'ADMIN') {
+    applicableItems = applicableItems.filter(
+      (item) => item.product.seller_id === voucher.seller_id
+    );
+  }
+  if (voucher.product_id) {
+    applicableItems = applicableItems.filter((item) => item.product_id === voucher.product_id);
+  }
+
+  if (applicableItems.length === 0) {
+    throw new VoucherError('Giỏ hàng không đủ điều kiện áp dụng voucher này');
+  }
+
+  // SỬA: Tính base amount với variant price
+  const baseAmount = applicableItems.reduce((sum, item) => {
+    const price = item.product_variant?.price ?? item.product.price; // ƯU TIÊN VARIANT PRICE
+    return sum + Number(price || 0) * item.quantity;
+  }, 0);
+
+  const minOrder = Number(voucher.min_order_amount ?? 0);
+  if (minOrder > 0 && baseAmount < minOrder) {
+    throw new VoucherError(
+      `Giá trị đơn tối thiểu để sử dụng voucher là ${minOrder.toLocaleString('vi-VN')}đ`
+    );
+  }
+
+  let discount = 0;
+  if (voucher.discount_type === 'PERCENT') {
+    discount = (baseAmount * Number(voucher.discount_value)) / 100;
+    if (voucher.max_discount_amount) {
+      discount = Math.min(discount, Number(voucher.max_discount_amount));
+    }
+  } else {
+    discount = Number(voucher.discount_value);
+  }
+  discount = Math.min(discount, baseAmount);
+
+  if (discount <= 0) {
+    throw new VoucherError('Voucher không áp dụng được cho giỏ hàng hiện tại');
+  }
+
+  const inferredSeller =
+    voucher.seller_id ??
+    (voucher.product_id
+      ? applicableItems[0]?.product?.seller_id ?? null
+      : null);
+
+  return {
+    voucher,
+    discount,
+    baseAmount,
+    userVoucherId: savedVoucher?.id || null, // null if PLATFORM voucher not saved yet
+    targetSellerId: inferredSeller,
+    isPlatformVoucher,
+  };
+}
+
+/**
+ * 📦 Lấy danh sách đơn hàng của người dùng hiện tại
+ */
+// Lấy tất cả seller_order của user, kèm thông tin product
+export async function listOrdersController(req: AuthenticatedRequest, res: Response) {
+  try {
+    const user_id = req.user?.id;
+    if (!user_id) return res.status(401).json({ message: 'Unauthorized' });
+
+    const sellerOrders = await prisma.seller_order.findMany({
+      where: {
+        orders: {
+          user_id
+        }
+      },
+      include: {
+        orders: {
+          include: {
+            order_item: {
+              include: { 
+                product: true,
+                product_variant: true 
+              }
+            }
+          }
+        },
+        seller: true,
+        shipping_order: {
+          include: {
+            shipping_tracking_event: {
+              orderBy: { happened_at: 'desc' },
+              take: 1,
+            },
+          },
+        },
+      },
+      orderBy: { created_at: 'desc' }
+    });
+
+    const mapped = sellerOrders.map(so => {
+      const items = so.orders.order_item.filter(oi => oi.product.seller_id === so.seller_id);
+      const latestTracking = so.shipping_order?.shipping_tracking_event?.[0] || null;
+      const fulfillmentStatus =
+        so.fulfillment_status ||
+        so.orders.fulfillment_status ||
+        so.seller_status ||
+        'pending';
+      return {
+        id: so.id,
+        order_id: so.order_id,
+        seller: so.seller,
+        total: Number(so.total),
+        status: so.seller_status || 'pending',
+        fulfillment_status: fulfillmentStatus,
+        shipping: so.shipping_order
+          ? {
+              shipping_order_id: so.shipping_order.id,
+              ghn_order_code: so.shipping_order.ghn_order_code,
+              ghn_status: so.shipping_order.ghn_status,
+              internal_status: so.shipping_order.status,
+              expected_delivery_time: so.shipping_order.expected_delivery_time,
+              synced_at: so.shipping_order.synced_at,
+              latest_event: latestTracking
+                ? {
+                    ghn_status: latestTracking.ghn_status,
+                    internal_status: latestTracking.internal_status,
+                    note: latestTracking.note,
+                    happened_at: latestTracking.happened_at,
+                  }
+                : null,
+            }
+          : null,
+        created_at: so.created_at,
+        items: items.map(i => ({
+          id: i.id,
+          product_id: i.product_id,
+          variant_id: i.variant_id, // THÊM: variant_id
+          title: i.product.title,
+          images: i.product.images,
+          variant_title: i.product_variant?.title, // THÊM: variant title
+          price: Number(i.price),
+          quantity: i.quantity
+        }))
+      };
+    });
+
+    return res.json({ data: mapped });
+
+  } catch (err: any) {
+    console.error(err);
+    return res.status(500).json({ message: err.message });
+  }
+}
+
+/**
+ * 🔍 Pre-validate địa chỉ trước khi tạo đơn hàng
+ * POST /api/orders/pre-validate
+ * Validate địa chỉ với GHN API trước khi user đặt hàng
+ */
+export async function preValidateOrderController(req: AuthenticatedRequest, res: Response) {
+  try {
+    if (!req.user) return res.status(401).json({ message: 'Unauthorized' });
+    
+    const { address_id, cart_item_ids } = req.body as {
+      address_id?: string;
+      cart_item_ids?: string[];
+    };
+
+    if (!address_id) {
+      return res.status(400).json({ 
+        valid: false,
+        error: 'address_id is required' 
+      });
+    }
+
+    // Lấy address
+    const address = await prisma.address.findFirst({
+      where: { id: address_id, user_id: req.user.id },
+    });
+
+    if (!address) {
+      return res.status(404).json({ 
+        valid: false,
+        error: 'Địa chỉ không tồn tại' 
+      });
+    }
+
+    // Validate address
+    const validation = await validateShippingRequirements(address);
+    if (!validation.valid) {
+      return res.status(400).json({
+        valid: false,
+        error: validation.error,
+      });
+    }
+
+    // Validate customer phone
+    let validatedCustomerPhone: string;
+    try {
+      validatedCustomerPhone = validateAndFormatPhone(address.phone);
+    } catch (error: any) {
+      return res.status(400).json({
+        valid: false,
+        error: `Số điện thoại không hợp lệ: ${error.message}`,
+      });
+    }
+
+    // Lấy shop config
+    let shopSettings = await prisma.shop_settings.findUnique({
+      where: { id: 'shop_settings_singleton' },
+    });
+
+    // Fallback về env nếu chưa có trong database
+    if (!shopSettings) {
+      const rawPhone = process.env.SHIP_FROM_PHONE || '';
+      shopSettings = {
+        id: 'shop_settings_singleton',
+        name: process.env.SHIP_FROM_NAME || 'Shop',
+        phone: rawPhone,
+        address_line: process.env.SHIP_FROM_ADDRESS || 'Hà Nội',
+        province_id: null,
+        province_name: null,
+        district_id: Number(process.env.SHIP_FROM_DISTRICT_ID || 1450),
+        district_name: null,
+        ward_code: process.env.SHIP_FROM_WARD_CODE || null,
+        ward_name: null,
+        created_at: new Date(),
+        updated_at: new Date(),
+      };
+    }
+
+    if (!shopSettings.ward_code || !shopSettings.district_id) {
+      return res.status(400).json({
+        valid: false,
+        error: 'Địa chỉ shop chưa được cấu hình. Vui lòng liên hệ admin.',
+      });
+    }
+
+    const shopConfig = {
+      from_name: shopSettings.name || 'Shop',
+      from_phone: shopSettings.phone,
+      from_address: shopSettings.address_line,
+      from_ward_code: shopSettings.ward_code,
+      from_district_id: shopSettings.district_id,
+    };
+
+    // Validate shop phone
+    let validatedShopPhone: string;
+    try {
+      if (!shopConfig.from_phone || shopConfig.from_phone.trim() === '') {
+        throw new Error('Shop phone is not configured');
+      }
+      validatedShopPhone = validateAndFormatPhone(shopConfig.from_phone);
+    } catch (error: any) {
+      return res.status(500).json({
+        valid: false,
+        error: `Số điện thoại shop không hợp lệ: ${error.message}`,
+      });
+    }
+
+    // Tính weight (nếu có cart_item_ids)
+    let weight = 500; // default
+    if (cart_item_ids?.length) {
+      try {
+        const cart_items = await fetchCartItems({ 
+          userId: req.user.id, 
+          cartItemIds: cart_item_ids 
+        });
+        weight = cart_items.reduce((sum, item) => {
+          const productWeight = item.product.weight ? Number(item.product.weight) * 1000 : 500;
+          return sum + productWeight * item.quantity;
+        }, 0);
+      } catch (error) {
+        console.warn('Could not calculate weight from cart items, using default:', error);
+      }
+    }
+
+    // Pre-validate với GHN
+    const preValidation = await preValidateGhnOrder({
+      to_name: address.full_name,
+      to_phone: validatedCustomerPhone,
+      to_address: `${address.address_line}, ${address.ward}, ${address.district}, ${address.city}`,
+      to_ward_code: address.ward_code!,
+      to_district_id: address.district_id!,
+      from_name: shopConfig.from_name,
+      from_phone: validatedShopPhone,
+      from_address: shopConfig.from_address,
+      from_ward_code: shopConfig.from_ward_code,
+      from_district_id: shopConfig.from_district_id,
+      weight,
+    });
+
+    if (preValidation.valid) {
+      return res.json({
+        valid: true,
+        message: 'Địa chỉ hợp lệ. Có thể tiếp tục đặt hàng.',
+        details: preValidation.details,
+      });
+    } else {
+      return res.status(400).json({
+        valid: false,
+        error: preValidation.error,
+        message: 'Địa chỉ không hợp lệ. Vui lòng kiểm tra lại.',
+      });
+    }
+  } catch (error: any) {
+    console.error('Pre-validate error:', error);
+    return res.status(500).json({
+      valid: false,
+      error: error.message || 'Lỗi khi validate địa chỉ',
+    });
+  }
+}
+
+/**
+ * 🛒 Tạo đơn hàng mới từ giỏ hàng
+ */
+export async function createOrderController(req: AuthenticatedRequest, res: Response) {
+  try {
+    if (!req.user) return res.status(401).json({ message: 'Unauthorized' });
+    const { cart_item_ids, voucher_code, shipping_code, address_id, payment_method } = req.body as {
+      cart_item_ids?: string[];
+      voucher_code?: string;
+      shipping_code?: string;
+      address_id?: string;
+      payment_method?: string;
+    };
+
+    if (!cart_item_ids?.length) {
+      return res.status(400).json({ message: 'Vui lòng chọn sản phẩm để đặt hàng' });
+    }
+
+    if (!address_id) {
+      return res.status(400).json({ message: 'Vui lòng chọn địa chỉ giao hàng' });
+    }
+
+    // Lấy address và user info
+    const address = await prisma.address.findFirst({
+      where: { id: address_id, user_id: req.user.id },
+    });
+
+    if (!address) {
+      return res.status(404).json({ message: 'Địa chỉ không tồn tại' });
+    }
+
+    // Validate address và GHN connectivity
+    console.log('🔍 Validating address:', {
+      address_id: address.id,
+      has_ward_code: !!address.ward_code,
+      has_district_id: !!address.district_id,
+      ward_code: address.ward_code,
+      district_id: address.district_id,
+    });
+    
+    const validation = await validateShippingRequirements(address);
+    if (!validation.valid) {
+      console.error('❌ Address validation failed:', validation.error);
+      // Gửi notification về validation failure
+      try {
+        const { notifyGhnConnectivityIssue } = await import('../services/notification.service');
+        if (validation.error?.includes('GHN API')) {
+          await notifyGhnConnectivityIssue(validation.error);
+        }
+      } catch (notifError) {
+        console.error('Failed to send notification:', notifError);
+      }
+      
+      return res.status(400).json({ message: validation.error });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.id },
+    });
+
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const cart_items = await fetchCartItems({ userId: req.user.id, cartItemIds: cart_item_ids });
+    console.log('🛒 Fetched cart items:', {
+      count: cart_items.length,
+      item_ids: cart_items.map(i => i.id),
+      products: cart_items.map(i => ({
+        id: i.product_id,
+        title: i.product.title,
+        price: i.product.price,
+        seller_id: i.product.seller_id,
+        weight: i.product.weight,
+        variant_id: i.variant_id, // THÊM: variant info
+        variant_price: i.product_variant?.price,
+      })),
+    });
+    
+    if (cart_items.length === 0) {
+      return res.status(400).json({ message: 'Cart is empty' });
+    }
+    
+    // Validate cart items have required fields
+    for (const item of cart_items) {
+      if (!item.product.title) {
+        console.error('❌ Product missing title:', item.product_id);
+        return res.status(400).json({ 
+          message: `Sản phẩm ${item.product_id} thiếu thông tin title. Vui lòng kiểm tra lại.` 
+        });
+      }
+      if (!item.product.seller_id) {
+        console.error('❌ Product missing seller_id:', item.product_id);
+        return res.status(400).json({ 
+          message: `Sản phẩm ${item.product_id} thiếu thông tin seller. Vui lòng kiểm tra lại.` 
+        });
+      }
+    }
+
+    // SỬA: Tính grossTotal với variant price
+    const grossTotal = sumCartItems(cart_items);
+    let appliedVoucher: VoucherApplication | null = null;
+
+    if (voucher_code?.trim()) {
+      try {
+        appliedVoucher = await validateVoucherForCart(
+          voucher_code.trim(),
+          req.user.id,
+          cart_items
+        );
+      } catch (error: any) {
+        const status = error instanceof VoucherError ? error.status : 400;
+        return res.status(status).json({ message: error.message || 'Voucher không hợp lệ' });
+      }
+    }
+
+    const orderTotal = Math.max(0, grossTotal - (appliedVoucher?.discount ?? 0));
+
+    // Tính weight từ products (gram)
+    const totalWeight = cart_items.reduce((sum, item) => {
+      const productWeight = item.product.weight ? Number(item.product.weight) * 1000 : 500; // Convert kg to gram, default 500g
+      return sum + productWeight * item.quantity;
+    }, 0);
+
+    // Determine payment_type_id: 1 = COD, 2 = Non-COD (PayPal, etc.)
+    const payment_type_id = payment_method === 'COD' ? 1 : 2;
+
+    // ============================================
+    // PRE-VALIDATION: Validate với GHN TRƯỚC khi tạo order
+    // ============================================
+    // Lấy shop config sớm để validate
+    let shopSettings = await prisma.shop_settings.findUnique({
+      where: { id: 'shop_settings_singleton' },
+    });
+
+    // Fallback về env nếu chưa có trong database
+    if (!shopSettings) {
+      const rawPhone = process.env.SHIP_FROM_PHONE || '';
+      console.log('⚠️ Shop settings not found in database, using env variables');
+      shopSettings = {
+        id: 'shop_settings_singleton',
+        name: process.env.SHIP_FROM_NAME || 'Shop',
+        phone: rawPhone,
+        address_line: process.env.SHIP_FROM_ADDRESS || 'Hà Nội',
+        province_id: null,
+        province_name: null,
+        district_id: Number(process.env.SHIP_FROM_DISTRICT_ID || 1450),
+        district_name: null,
+        ward_code: process.env.SHIP_FROM_WARD_CODE || null,
+        ward_name: null,
+        created_at: new Date(),
+        updated_at: new Date(),
+      };
+    }
+
+    // Validate shop address có đầy đủ thông tin GHN
+    if (!shopSettings.ward_code || !shopSettings.district_id) {
+      console.error('❌ Shop address missing GHN information:', {
+        has_ward_code: !!shopSettings.ward_code,
+        has_district_id: !!shopSettings.district_id,
+        ward_code: shopSettings.ward_code,
+        district_id: shopSettings.district_id,
+      });
+      return res.status(400).json({
+        message: `Địa chỉ shop thiếu thông tin GHN (ward_code: ${shopSettings.ward_code ? 'có' : 'thiếu'}, district_id: ${shopSettings.district_id ? 'có' : 'thiếu'}). ` +
+          `Vui lòng cấu hình địa chỉ shop tại /admin/settings với đầy đủ Tỉnh/Thành phố, Quận/Huyện, và Phường/Xã.`
+      });
+    }
+
+    const shopConfig = {
+      from_name: shopSettings.name || 'Shop',
+      from_phone: shopSettings.phone,
+      from_address: shopSettings.address_line,
+      from_ward_code: shopSettings.ward_code,
+      from_district_id: shopSettings.district_id,
+    };
+
+    // Validate shop phone
+    let validatedShopPhone: string;
+    try {
+      if (!shopConfig.from_phone || shopConfig.from_phone.trim() === '') {
+        throw new Error('SHIP_FROM_PHONE environment variable is not set or is empty. Please add SHIP_FROM_PHONE=0987654321 to your .env file in the backend folder.');
+      }
+      validatedShopPhone = validateAndFormatPhone(shopConfig.from_phone);
+    } catch (error: any) {
+      console.error('❌ Shop phone validation failed:', {
+        input: shopConfig.from_phone,
+        error: error.message,
+      });
+      return res.status(500).json({ 
+        message: `Shop phone number is invalid: ${error.message}. Please configure SHIP_FROM_PHONE in environment variables with a valid Vietnamese phone number (10 digits, starting with 0). Example: SHIP_FROM_PHONE=0987654321` 
+      });
+    }
+
+    // Validate customer phone
+    let validatedCustomerPhone: string;
+    try {
+      validatedCustomerPhone = validateAndFormatPhone(address.phone);
+    } catch (error: any) {
+      return res.status(400).json({ 
+        message: `Customer phone number is invalid: ${error.message}. Please update the address with a valid phone number.` 
+      });
+    }
+
+    // PRE-VALIDATE với GHN API trước khi tạo order
+    console.log('🔍 Pre-validating GHN order before creating order...');
+    console.log('📍 Pre-validation params:', {
+      to_address: `${address.address_line}, ${address.ward}, ${address.district}, ${address.city}`,
+      to_ward_code: address.ward_code,
+      to_district_id: address.district_id,
+      from_address: shopConfig.from_address,
+      from_ward_code: shopConfig.from_ward_code,
+      from_district_id: shopConfig.from_district_id,
+      weight: totalWeight,
+    });
+
+    const preValidation = await preValidateGhnOrder({
+      to_name: address.full_name,
+      to_phone: validatedCustomerPhone,
+      to_address: `${address.address_line}, ${address.ward}, ${address.district}, ${address.city}`,
+      to_ward_code: address.ward_code!,
+      to_district_id: address.district_id!,
+      from_name: shopConfig.from_name,
+      from_phone: validatedShopPhone,
+      from_address: shopConfig.from_address,
+      from_ward_code: shopConfig.from_ward_code,
+      from_district_id: shopConfig.from_district_id,
+      weight: totalWeight,
+    });
+
+    if (!preValidation.valid) {
+      console.error('❌ Pre-validation failed:', preValidation.error);
+      return res.status(400).json({
+        message: 'Địa chỉ giao hàng không hợp lệ với GHN. Vui lòng kiểm tra lại địa chỉ hoặc liên hệ hỗ trợ.',
+        error: preValidation.error,
+        details: 'Địa chỉ giao hàng không hợp lệ với GHN. Vui lòng kiểm tra lại địa chỉ hoặc liên hệ hỗ trợ.',
+      });
+    }
+
+    console.log('✅ Pre-validation passed. Proceeding to create order...');
+    if (preValidation.details) {
+      console.log('📊 Pre-validation details:', preValidation.details);
+    }
+    // ============================================
+    // END PRE-VALIDATION
+    // ============================================
+
+    // ============================================
+    // TẠO GHN ORDERS TRƯỚC - Nếu fail thì không tạo order trong DB
+    // ============================================
+    // Tính toán seller info trước để tạo GHN orders
+    const sellerMap = new Map<string, CartItemWithProduct[]>();
+    cart_items.forEach((item) => {
+      const sellerId = item.product.seller_id;
+      if (!sellerMap.has(sellerId)) sellerMap.set(sellerId, []);
+      sellerMap.get(sellerId)!.push(item);
+    });
+
+    const sellerTotals = new Map<string, number>();
+    sellerMap.forEach((items, sellerId) => {
+      sellerTotals.set(sellerId, sumCartItems(items));
+    });
+
+    const sellerDiscountMap = new Map<string, number>();
+    if (appliedVoucher) {
+      // For PLATFORM vouchers (source='ADMIN'), distribute discount across all sellers
+      // For seller vouchers, apply discount to specific seller
+      if (appliedVoucher.voucher.source === 'ADMIN') {
+        // PLATFORM voucher: distribute discount proportionally
+        const baseTotal = Array.from(sellerTotals.values()).reduce((sum, val) => sum + val, 0);
+        let allocated = 0;
+        const entries = Array.from(sellerTotals.entries());
+        entries.forEach(([sellerId, sellerTotal], index) => {
+          if (baseTotal === 0) {
+            sellerDiscountMap.set(sellerId, 0);
+            return;
+          }
+          let portion = (appliedVoucher!.discount * sellerTotal) / baseTotal;
+          portion = Math.min(portion, sellerTotal);
+          if (index === entries.length - 1) {
+            portion = Math.min(appliedVoucher!.discount - allocated, sellerTotal);
+          }
+          portion = Number(Number(portion).toFixed(2));
+          allocated += portion;
+          sellerDiscountMap.set(sellerId, Math.max(0, portion));
+        });
+      } else if (appliedVoucher.voucher.seller_id || appliedVoucher.targetSellerId) {
+        // Seller voucher: apply discount to specific seller
+        const target = appliedVoucher.voucher.seller_id || appliedVoucher.targetSellerId;
+        if (target) {
+          sellerDiscountMap.set(target, appliedVoucher.discount);
+        }
+      }
+    }
+
+    // Lấy seller info để lấy from_address
+    const sellers = await prisma.seller.findMany({
+      where: { id: { in: Array.from(sellerMap.keys()) } },
+    });
+    const sellerInfoMap = new Map(sellers.map(s => [s.id, s]));
+
+    // Tạo GHN orders cho tất cả sellers TRƯỚC khi tạo order trong DB
+    const ghnOrderResults: Array<{
+      seller_id: string;
+      success: boolean;
+      orderCode: string | null;
+      error: string | null;
+      sellerWeight: number;
+      ghnItems: any[];
+    }> = [];
+
+    for (const [seller_id, items] of sellerMap) {
+      // Tính weight cho seller items (gram)
+      const sellerWeight = items.reduce((sum, item) => {
+        const productWeight = item.product.weight ? Number(item.product.weight) * 1000 : 500;
+        return sum + productWeight * item.quantity;
+      }, 0);
+
+      // Tạo items array cho GHN - SỬA: Sử dụng variant price và title nếu có
+      const ghnItems = items.map(item => {
+        // Ưu tiên variant title và price
+        const productTitle = item.product_variant?.title 
+          ? `${item.product.title} - ${item.product_variant.title}`
+          : item.product.title || `Sản phẩm ${item.product_id}`;
+        
+        const productPrice = item.product_variant?.price ?? item.product.price;
+        const productWeight = item.product.weight ? Number(item.product.weight) * 1000 : 500;
+        
+        if (!productTitle) {
+          console.warn(`⚠️ Product ${item.product_id} has no title, using fallback`);
+        }
+        
+        return {
+          name: productTitle,
+          quantity: item.quantity,
+          weight: productWeight,
+          price: Number(productPrice) || 0,
+          product_code: item.product_id,
+        };
+      });
+      
+      console.log('📦 GHN items prepared:', ghnItems);
+
+      // Validate required address fields before calling GHN
+      if (!address.ward_code || !address.district_id) {
+        console.error('❌ Missing required address fields:', {
+          seller_id,
+          has_ward_code: !!address.ward_code,
+          has_district_id: !!address.district_id,
+        });
+        throw new Error(
+          `Địa chỉ thiếu thông tin cần thiết (ward_code: ${address.ward_code ? 'có' : 'thiếu'}, ` +
+          `district_id: ${address.district_id ? 'có' : 'thiếu'}). ` +
+          `Vui lòng cập nhật địa chỉ với đầy đủ thông tin.`
+        );
+      }
+      
+      // Validate shop ward_code và district_id trước khi gọi GHN
+      if (!shopConfig.from_ward_code || !shopConfig.from_district_id) {
+        console.error(`❌ Shop config invalid for seller ${seller_id}:`, {
+          from_ward_code: shopConfig.from_ward_code,
+          from_district_id: shopConfig.from_district_id,
+        });
+        throw new Error(
+          `Địa chỉ shop không hợp lệ: ward_code=${shopConfig.from_ward_code || 'thiếu'}, ` +
+          `district_id=${shopConfig.from_district_id || 'thiếu'}. ` +
+          `Vui lòng cấu hình địa chỉ shop tại /admin/settings.`
+        );
+      }
+
+      // Gọi GHN API để tạo shipping order với retry mechanism
+      let retryResult;
+      try {
+        console.log(`🚚 Creating GHN order for seller ${seller_id}...`);
+        console.log(`📍 Shop address (from):`, {
+          name: shopConfig.from_name,
+          address: shopConfig.from_address,
+          ward_code: shopConfig.from_ward_code,
+          district_id: shopConfig.from_district_id,
+        });
+        console.log(`📍 Customer address (to):`, {
+          name: address.full_name,
+          address: `${address.address_line}, ${address.ward}, ${address.district}, ${address.city}`,
+          ward_code: address.ward_code,
+          district_id: address.district_id,
+        });
+        retryResult = await retryGhnOrderCreation({
+          to_name: address.full_name,
+          to_phone: validatedCustomerPhone,
+          to_address: `${address.address_line}, ${address.ward}, ${address.district}, ${address.city}`,
+          to_ward_code: address.ward_code,
+          to_district_id: address.district_id,
+          weight: sellerWeight,
+          length: 10,
+          width: 10,
+          height: 10,
+          service_type_id: 2,
+          payment_type_id: payment_type_id,
+          required_note: 'KHONGCHOXEMHANG',
+          note: '',
+          items: ghnItems,
+          from_name: shopConfig.from_name,
+          from_phone: validatedShopPhone,
+          from_address: shopConfig.from_address,
+          from_ward_code: shopConfig.from_ward_code,
+          from_district_id: shopConfig.from_district_id,
+        }, 3, 1000); // 3 retries, 1s delay
+        console.log(`✅ GHN order result for seller ${seller_id}:`, {
+          success: retryResult.success,
+          orderCode: retryResult.orderCode,
+          error: retryResult.error,
+        });
+      } catch (retryError: any) {
+        console.error(`❌ Error in retryGhnOrderCreation for seller ${seller_id}:`, retryError);
+        console.error('Retry error details:', {
+          message: retryError.message,
+          stack: retryError.stack,
+        });
+        retryResult = {
+          success: false,
+          orderCode: null,
+          error: retryError.message || 'Failed to create GHN order',
+        };
+      }
+
+      ghnOrderResults.push({
+        seller_id,
+        success: retryResult.success,
+        orderCode: retryResult.orderCode,
+        error: retryResult.error,
+        sellerWeight,
+        ghnItems,
+      });
+    }
+
+    // Kiểm tra: Nếu có bất kỳ GHN order nào fail → không tạo order trong DB
+    const failedGhnOrders = ghnOrderResults.filter(r => !r.success);
+    if (failedGhnOrders.length > 0) {
+      console.error('❌ Một số GHN orders failed. Không tạo order trong database.');
+      console.error('Failed GHN orders:', failedGhnOrders.map(r => ({
+        seller_id: r.seller_id,
+        error: r.error,
+      })));
+
+      // Gửi notification về lỗi
+      try {
+        const { notifyGhnConnectivityIssue } = await import('../services/notification.service');
+        await notifyGhnConnectivityIssue(
+          `Không thể tạo đơn hàng: ${failedGhnOrders.map(r => r.error).join('; ')}`
+        );
+      } catch (notifError) {
+        console.error('Failed to send notification:', notifError);
+      }
+
+      return res.status(400).json({
+        message: 'Không thể tạo đơn hàng',
+        error: 'Một số đơn vận chuyển không thể được tạo với GHN',
+        details: failedGhnOrders.map(r => ({
+          seller_id: r.seller_id,
+          error: r.error,
+        })),
+      });
+    }
+
+    console.log('✅ Tất cả GHN orders đã được tạo thành công. Tiến hành tạo order trong database...');
+
+    // ============================================
+    // TẤT CẢ GHN ORDERS THÀNH CÔNG → TẠO ORDER TRONG DATABASE
+    // ============================================
+    const order = await prisma.orders.create({
+      data: {
+        user_id: req.user.id,
+        total: orderTotal,
+        status: 'pending',
+        shipping_code: shipping_code?.trim() || null,
+        address_id: address_id,
+        payment_method: payment_method || 'COD',
+        payment_type_id: payment_type_id,
+        service_type_id: 2,
+        to_name: address.full_name,
+        to_phone: address.phone,
+        to_address: `${address.address_line}, ${address.ward}, ${address.district}, ${address.city}`,
+        to_ward_name: address.ward,
+        to_district_name: address.district,
+        to_province_name: address.city,
+        required_note: 'KHONGCHOXEMHANG',
+        weight: totalWeight,
+        length: 10,
+        width: 10,
+        height: 10,
+        system_voucher:
+          appliedVoucher && appliedVoucher.voucher.source === 'ADMIN'
+            ? {
+                code: appliedVoucher.voucher.code,
+                discount: appliedVoucher.discount,
+                type: appliedVoucher.voucher.type,
+                source: appliedVoucher.voucher.source,
+              }
+            : undefined,
+        order_item: {
+          // SỬA: Lưu variant_id và sử dụng variant price
+          create: cart_items.map((item) => ({
+            product_id: item.product_id,
+            variant_id: item.variant_id, // THÊM: Lưu variant_id
+            price: item.product_variant?.price ?? item.product.price, // ƯU TIÊN VARIANT PRICE
+            quantity: item.quantity,
+          })),
+        },
+      },
+      include: {
+        order_item: { 
+          include: { 
+            product: true,
+            product_variant: true // THÊM: Include variant information
+          } 
+        },
+      },
+    });
+
+    // ============================================
+    // TẠO SELLER_ORDERS VÀ SHIPPING_ORDERS VỚI KẾT QUẢ GHN ĐÃ TẠO
+    // ============================================
+    const sellerOrders = [];
+    
+    // Tạo seller_orders và shipping_orders từ kết quả GHN đã tạo thành công
+    for (const ghnResult of ghnOrderResults) {
+      const { seller_id, orderCode, sellerWeight } = ghnResult;
+      const items = sellerMap.get(seller_id)!;
+      const sellerTotal = sellerTotals.get(seller_id) ?? 0;
+      const sellerDiscount = sellerDiscountMap.get(seller_id) ?? 0;
+      
+      // Tạo seller_order
+      const sellerOrder = await prisma.seller_order.create({
+        data: {
+          order_id: order.id,
+          seller_id,
+          total: Math.max(0, sellerTotal - sellerDiscount),
+          seller_status: 'pending',
+          shop_voucher:
+            sellerDiscount > 0 && 
+            appliedVoucher?.voucher.source !== 'ADMIN' && 
+            appliedVoucher?.voucher.seller_id === seller_id
+              ? {
+                  code: appliedVoucher.voucher.code,
+                  discount: sellerDiscount,
+                }
+              : undefined,
+          created_at: order.created_at,
+          updated_at: order.updated_at,
+        },
+      });
+
+      // Lưu shipping_order với GHN order code đã tạo thành công
+      // Tất cả GHN orders đã được tạo thành công ở bước trước, nên orderCode chắc chắn có
+      console.log(`💾 Saving shipping_order for seller ${seller_id} with GHN order code: ${orderCode}...`);
+      const shippingOrder = await prisma.shipping_order.create({
+        data: {
+          seller_order_id: sellerOrder.id,
+          ghn_order_code: orderCode!, // Đã validate thành công ở bước trước
+          to_ward_code: address.ward_code!,
+          to_district_id: address.district_id!,
+          to_province_id: address.province_id || null,
+          weight: sellerWeight,
+          length: 10,
+          width: 10,
+          height: 10,
+          service_type_id: 2,
+          payment_type_id: payment_type_id,
+          items: ghnResult.ghnItems as any,
+          status: 'created', // Tất cả đã thành công
+          error_message: null, // Không có lỗi
+          retry_count: 0,
+          last_retry_at: null,
+        },
+      });
+      console.log(`✅ Created shipping_order ${shippingOrder.id} for seller ${seller_id}`);
+
+      sellerOrders.push(sellerOrder);
+    }
+
+    await prisma.cart_item.deleteMany({
+      where: { user_id: req.user.id, id: { in: cart_item_ids } },
+    });
+
+    if (appliedVoucher) {
+      await prisma.$transaction([
+        prisma.vouchers.update({
+          where: { id: appliedVoucher.voucher.id },
+          data: { used_count: (appliedVoucher.voucher.used_count ?? 0) + 1 },
+        }),
+        // If PLATFORM voucher and not saved yet, create user_vouchers record
+        // Otherwise, update existing record
+        appliedVoucher.userVoucherId
+          ? prisma.user_vouchers.update({
+              where: {
+                user_id_voucher_id: {
+                  user_id: req.user.id,
+                  voucher_id: appliedVoucher.voucher.id,
+                },
+              },
+              data: {
+                usage_count: { increment: 1 },
+                used_at: new Date(),
+              },
+            })
+          : prisma.user_vouchers.upsert({
+              where: {
+                user_id_voucher_id: {
+                  user_id: req.user.id,
+                  voucher_id: appliedVoucher.voucher.id,
+                },
+              },
+              update: {
+                usage_count: { increment: 1 },
+                used_at: new Date(),
+              },
+              create: {
+                user_id: req.user.id,
+                voucher_id: appliedVoucher.voucher.id,
+                usage_count: 1,
+                used_at: new Date(),
+              },
+            }),
+      ]);
+    }
+
+    return res.status(201).json({ order, sellerOrders });
+  } catch (error: any) {
+    console.error('❌ createOrderController error:', error);
+    console.error('Error stack:', error.stack);
+    console.error('Error details:', {
+      message: error.message,
+      code: error.code,
+      meta: error.meta,
+      cause: error.cause,
+      name: error.name,
+    });
+    
+    // Log request body for debugging (without sensitive data)
+    console.error('Request body:', {
+      cart_item_ids: req.body?.cart_item_ids,
+      address_id: req.body?.address_id,
+      payment_method: req.body?.payment_method,
+      has_voucher_code: !!req.body?.voucher_code,
+    });
+    
+    // Trả về error message chi tiết hơn để debug
+    const errorMessage = error.message || 'Internal server error';
+    const isPrismaError = error.code && error.code.startsWith('P');
+    
+    return res.status(500).json({ 
+      message: errorMessage,
+      ...(isPrismaError && { 
+        hint: 'Có thể Prisma schema chưa được migrate. Hãy chạy: npx prisma migrate dev && npx prisma generate',
+        code: error.code,
+        meta: error.meta,
+      }),
+      ...(process.env.NODE_ENV === 'development' && {
+        stack: error.stack,
+      })
+    });
+  }
+}
+
+/**
+ * 🔍 Lấy chi tiết một đơn hàng hoặc tất cả đơn hàng
+ */
+export async function getOrdersController(req: AuthenticatedRequest, res: Response) {
+  try {
+    if (!req.user) return res.status(401).json({ message: 'Unauthorized' });
+
+    // Lấy tất cả đơn hàng của user, kèm order_item + product + seller_order
+    const orders = await prisma.orders.findMany({
+      where: { user_id: req.user.id },
+      include: {
+        order_item: { 
+          include: { 
+            product: true,
+            product_variant: true // THÊM: Include variant information
+          } 
+        },
+        seller_order: {
+          include: {
+            seller: {
+              select: {
+                id: true,
+                name: true,
+              }
+            }
+          }
+        }
+      },
+      orderBy: { created_at: 'desc' }, // mới nhất lên đầu
+    });
+
+    return res.status(200).json({ items: orders }); // ⚡ trả về array
+  } catch (error) {
+    console.error('❌ getOrdersController error:', error);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+}
